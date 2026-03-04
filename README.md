@@ -51,11 +51,13 @@ There is no intentional difference between the 2 variants, other than to provide
 
 ## Dependencies
 
-The code has been developed and tested on a linux machine using python 3.13.11 and pytorch for model training with sklearn modelling pipelines. The dependencies are listed in the `requirements.txt` file located in the root of the 02_code folder. 
+The code has been developed and tested on a linux machine using python 3.13.11 and `pytorch` for model training with sklearn modelling pipelines. The dependencies are listed in the `requirements.txt` file located in the root of the 02_code folder. 
 
-For NN trainnig I've used CPU only, the config file can be amended to use GPU but I have been unable to conprehensively test GPU training functionality.
+For NN training I've used CPU only, the config file can be amended to use GPU but I have been unable to comprehensively test GPU training functionality.
 
 There are complex python library dependencies so I would recommend setting up a new virtual environment and installing the dependencies as set out in `requirements.txt`. 
+
+Alternatively if using `uv` then `uv sync` is set up to install the python version and dependencies. 
 
 ## TensorBoard Visualization
 
