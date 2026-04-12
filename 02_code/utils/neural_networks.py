@@ -83,7 +83,6 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
     def __init__(
         self, 
         module,
-        #criterion=nn.MSELoss(),
         criterion=nn.PoissonNLLLoss,
         max_iter=100,   
         max_lr=0.01,
@@ -91,8 +90,6 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         batch_function=None,
         rebatch_every_iter=1,
         n_hidden=20,    
-        #n_input=nfeatures,
-        #n_output=1,
         l1_penalty=0.0,          # lambda is a reserved word
         l1_applies_params=["linear.weight", "hidden.weight"],
         weight_decay=0.0,
@@ -102,7 +99,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         clip_value=None,
         n_gaussians=3,
         verbose=1,                
-        device="cpu", 
+        device="default", 
         init_bias=None,
         enable_shap=True,  # Enable SHAP explanations
         shap_log_frequency=500,  # Log SHAP every N epochs
@@ -152,7 +149,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
             verbose (int): Verbosity level
 
-            device (str): Device to use ('cpu', 'cuda', etc.)
+            device (str): Device to use ('cpu', 'cuda', etc.). 'default' will pick gpu if available.
 
             init_bias (None or float): If not None, initialize output layer bias to this value
 
@@ -169,8 +166,6 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.batch_function = batch_function
         self.rebatch_every_iter = rebatch_every_iter
         self.n_hidden = n_hidden
-        #self.n_input = n_input
-        #self.n_output = n_output
         self.l1_penalty = l1_penalty
         self.l1_applies_params = l1_applies_params
         self.weight_decay = weight_decay
@@ -180,7 +175,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.clip_value = clip_value
         self.n_gaussians = n_gaussians
         self.verbose = verbose
-        self.device = device
+        
         self.init_bias = init_bias
         self.enable_shap = enable_shap
         self.shap_log_frequency = shap_log_frequency
@@ -189,9 +184,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.writer = writer
         self.init_extra = init_extra if init_extra is not None else {}
         self.kwargs = kwargs
-        
-        # Target device for tensors
-        self.target_device = torch.device(device)
+        self.device = device
         
         # Training state
         self.module_ = None
@@ -210,8 +203,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         return y
         
 
-    def setup_module(self, n_input, n_output):
-         
+    def setup_module(self, n_input, n_output):      
         # Training new model
         self.module_ = self.module(
             n_input=n_input, 
@@ -227,25 +219,63 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         ).to(self.target_device)
         
 
-    def fit(self, X, y):
+    def setup_device(self):
+        # Target device for tensors
+        if self.device == "default":
+            # Use GPU if available
+            if torch.backends.mps.is_available():
+                device = "mps"  
+            elif torch.cuda.is_available():
+                device = "cuda" 
+            else:
+                device = "cpu",  
+        else:
+            device = self.device
+
+        self.target_device = torch.device(device)   
+
+
+    def fit(self, X, y, sample_weight=None):
         # The main fit logic is in partial_fit
         # We will try a few times if numbers explode because NN's are finicky and we are doing CV
         n_input = X.shape[-1]
         n_output = 1 if y.ndim == 1 else y.shape[-1]
-        self.init_bias_calc = np.log(y.mean()).astype(np.float32)
+        
+        self.setup_device()
+
+        # Initial bias (1D or 2D array compatible)
+        if sample_weight is None:
+            self.init_bias_calc = torch.log(
+                torch.from_numpy(self.fix_array(y).mean(axis=0))           
+            ).to(self.target_device)
+        else:
+            # Divide by sample weight
+            self.init_bias_calc = torch.log(
+                torch.from_numpy(
+                    self.fix_array(y).sum(axis=0) / 
+                    self.fix_array(sample_weight).sum(axis=0)
+            )).to(self.target_device)
+
+
         self.setup_module(n_input=n_input, n_output=n_output)
 
         # Partial fit means you take an existing model and keep training 
         # so the logic is basically the same
-        self.partial_fit(X, y)
+        self.partial_fit(X, y, sample_weight=sample_weight)
         
         return self
 
 
-    def partial_fit(self, X, y):
+    def partial_fit(self, X, y, sample_weight=None):
         # Check that X and y have correct shape
-        #X, y = check_X_y(X, y, multi_output=True)
         X, y = check_X_y(X, y, multi_output=True, allow_nd=True) # all 3d to pass thru
+
+        # Check sample weights (if used)
+        if sample_weight is not None:
+            # sample_weight = check_sample_weight(sample_weight, X)`
+            weight_tensor = torch.from_numpy(self.fix_array(sample_weight)).to(self.target_device)
+        else:
+            weight_tensor = None
 
         # Convert to Pytorch Tensor
         X_tensor = torch.from_numpy(self.fix_array(X)).to(self.target_device)
@@ -268,23 +298,34 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         
         # Loss Function
         try:
-            loss_fn = self.criterion(log_input=False).to(self.target_device)  # Pytorch loss function
+            loss_fn = self.criterion(
+                log_input=False,
+                # need full loss to apply sample weight
+                reduction='mean' if sample_weight is None else 'none'
+            ).to(self.target_device)  # Pytorch loss function
         except TypeError:
             loss_fn = self.criterion  # Custom loss function
 
-        
         self.training_losses_history = []
         self.training_rmses_history = []
         self.saved_parameters = {}
         self.testing_epochs = []
      
-     
         best_loss = float('inf') # set to infinity initially
-
-        if self.batch_function is not None:
-            X_tensor_batch, y_tensor_batch = self.batch_function(X_tensor, y_tensor)
+        if sample_weight is not None:
+            if self.batch_function is not None:
+                w_tensor_batch, X_tensor_batch, y_tensor_batch = self.batch_function(
+                    X_tensor, y_tensor, sample_weight=weight_tensor, device=self.target_device
+                )
+            else:
+                w_tensor_batch, X_tensor_batch, y_tensor_batch = weight_tensor, X_tensor, y_tensor
         else:
-            X_tensor_batch, y_tensor_batch = X_tensor, y_tensor
+            if self.batch_function is not None:
+                X_tensor_batch, y_tensor_batch = self.batch_function(
+                    X_tensor, y_tensor, device=self.target_device
+                )
+            else:
+                X_tensor_batch, y_tensor_batch = X_tensor, y_tensor
 
         # Initialize SHAP explainer if enabled
         if self.enable_shap and self.shap_explainer is None:
@@ -305,9 +346,16 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
             self.module_.train()
             y_pred = self.module_(X_tensor_batch)  #  Apply current model
-            loss = loss_fn(y_pred, y_tensor_batch) #  What is the loss on it?
+            #  What is the loss on it?
+            loss = loss_fn(y_pred, y_tensor_batch) 
 
-            if self.l1_penalty > 0.0:        #  Lasso penalty
+            # Apply weights
+            if sample_weight is not None:
+                w_normalized = w_tensor_batch / w_tensor_batch.sum()
+                loss = (w_normalized * loss).sum()
+
+            # Lasso penalty
+            if self.l1_penalty > 0.0:        
                 loss += self.l1_penalty * sum(
                     [
                         w.abs().sum()
@@ -346,7 +394,15 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                 #Calculate the training loss on the entire dataset
                 with torch.no_grad():
                     y_pred_full = self.module_(X_tensor)
-                    full_train_loss = loss_fn(y_pred_full, y_tensor).item()
+                    full_train_loss = loss_fn(y_pred_full, y_tensor)
+
+                    # Apply weights
+                    if sample_weight is not None:
+                        w_normalized = weight_tensor / weight_tensor.sum()
+                        full_train_loss = (w_normalized * full_train_loss).sum()
+
+                    full_train_loss = full_train_loss.item()
+
                     self.training_losses_history.append(full_train_loss)
                     
                     # Calculate the RMSE over the entire dataset
@@ -362,7 +418,6 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                 self.module_.point_estimates=False       # Distributional models - set to point
                 
                 print(f"Epoch: {epoch} Train RMSE: {rmse.data.tolist()} Train Loss: {full_train_loss}")
-
 
                 # Tensorboard logging
                 if self.writer is not None:
@@ -444,13 +499,24 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                         except Exception as e:
                             if self.verbose > 0:
                                 print(f"Warning: SHAP logging failed at epoch {epoch}: {e}")
-
+                    plt.close(fig) # Clean up - prevent memory leak
 
             if (self.batch_function is not None) & (epoch % self.rebatch_every_iter == 0):
                 print(f"refreshing batch on epoch {epoch}")
-                X_tensor_batch, y_tensor_batch = self.batch_function(X_tensor, y_tensor)
-        
-           
+                if sample_weight is not None:
+                    if self.batch_function is not None:
+                        w_tensor_batch, X_tensor_batch, y_tensor_batch = self.batch_function(
+                            X_tensor, y_tensor, sample_weight=weight_tensor, device=self.target_device
+                        )
+                    else:
+                        w_tensor_batch, X_tensor_batch, y_tensor_batch = weight_tensor, X_tensor, y_tensor
+                else:
+                    if self.batch_function is not None:
+                        X_tensor_batch, y_tensor_batch = self.batch_function(
+                            X_tensor, y_tensor, device=self.target_device
+                        )
+                    else:
+                        X_tensor_batch, y_tensor_batch = X_tensor, y_tensor
 
         if self.keep_best_model:
             self.module_.load_state_dict(self.best_model)
@@ -472,8 +538,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
         # Apply current model and convert back to numpy
         if point_estimates:
-            #y_pred = self.module_(X_tensor).cpu().detach().numpy()
-            y_pred = self.module_(X_tensor).detach().numpy()
+            y_pred = self.module_(X_tensor).cpu().detach().numpy()
             if y_pred.shape[-1] == 1: 
                 return y_pred.ravel()
             else:
@@ -501,7 +566,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
         return hn.cpu().numpy()
 
-    def get_testing_losses(self, X_test, y_test):
+    def get_testing_losses(self, X_test, y_test, sample_weight=None):
         """
         Calculates and returns the testing losses and RMSEs using the parameters
         saved during training.
@@ -515,12 +580,15 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         X_test_tensor = torch.from_numpy(self.fix_array(X_test)).to(self.target_device)
         y_test_tensor = torch.from_numpy(self.fix_array(y_test)).to(self.target_device)
         
-        # Initialize the loss function
+        # Loss Function
         try:
-            loss_fn = self.criterion(log_input=False).to(self.target_device)
+            loss_fn = self.criterion(
+                log_input=False,
+                # need full loss to apply sample weight
+                reduction='mean' if sample_weight is None else 'none'
+            ).to(self.target_device)  # Pytorch loss function
         except TypeError:
-            # For custom loss functions
-            loss_fn = self.criterion
+            loss_fn = self.criterion  # Custom loss function
 
         testing_losses = []
         testing_rmses = []
@@ -536,7 +604,15 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                 # Get predictions on the test set
                 y_pred_test = self.module_(X_test_tensor)
                 # Calculate and append test loss
-                test_loss = loss_fn(y_pred_test, y_test_tensor).item()
+                test_loss = loss_fn(y_pred_test, y_test_tensor)
+
+                # Apply weights
+                if sample_weight is not None:
+                    w_normalized = sample_weight / sample_weight.sum()
+                    loss = (w_normalized * loss).sum()
+
+                test_loss = test_loss.item()
+
                 # Calculate and append test RMSE
                 test_rmse = torch.sqrt(torch.mean(torch.square(y_pred_test - y_test_tensor))).item()
                 
@@ -642,8 +718,13 @@ class BasicLogGRU(nn.Module):
         
         # Initialize bias if provided
         if init_bias is not None:
-            self.linear.bias.data.fill_(init_bias)
-    
+            try:
+                self.linear.bias.data.fill_(init_bias.item())
+            except RuntimeError:
+                # For 2D bias values
+                with torch.no_grad():
+                    self.linear.bias.copy_(init_bias)
+
     def forward(self, x):
         # GRU forward pass
         h, _ = self.gru(x)
@@ -700,7 +781,12 @@ class BasicLogLSTM(nn.Module):
         
         # Initialize bias if provided
         if init_bias is not None:
-            self.linear.bias.data.fill_(init_bias)
+            try:
+                self.linear.bias.data.fill_(init_bias.item())
+            except RuntimeError:
+                # For 2D bias values
+                with torch.no_grad():
+                    self.linear.bias.copy_(init_bias)
     
     def forward(self, x):
         # LSTM forward pass
@@ -758,7 +844,12 @@ class BasicLogRNN(nn.Module):
         
         # Initialize bias if provided
         if init_bias is not None:
-            self.linear.bias.data.fill_(init_bias)
+            try:
+                self.linear.bias.data.fill_(init_bias.item())
+            except RuntimeError:
+                # For 2D bias values
+                with torch.no_grad():
+                    self.linear.bias.copy_(init_bias)
     
     def forward(self, x):
         # RNN forward pass
@@ -969,13 +1060,19 @@ class Make3D(BaseEstimator, TransformerMixin):
     Variable lengths: Different claims have different numbers of payments, requiring padding
     
     Example output shape:
+     - With `full_history` False:
     If you have 100 claims, max 20 time steps, and 5 features, the output tensor would be (100, 20, 5).
-
+     - With `full_history` True:
+    This repeats the full history as at each time period in the sequence. 
+    The output tensor would be (row count, 20, 5)
+    
     This transformer is essential for preparing your claims data for the GRU model that predicts ultimate claim amounts based on payment history.
     """
 
-    def __init__(self, data_cols):
+    def __init__(self, data_cols, full_history=False, config=None):
         self.features = data_cols
+        self.full_history = full_history
+        self.config = config
 
     def fit(self, X, y=None):
         # No fitting necessary; return self
@@ -983,7 +1080,37 @@ class Make3D(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         # Group by 'claim_no'
-        grouped = X.groupby('claim_no')
+        if self.full_history:  # If full_history is True, repeat the historical transactions
+            # Reset index to ensure every row has a unique numeric identifier before we duplicate
+            X = X.copy().reset_index(drop=True)
+
+            # Step 1: Find min_development_period per claim_no and attach it back
+            X['min_development_period'] = X.groupby('claim_no')['development_period'].transform('min')
+
+            # Step 2: Calculate the number of times to duplicate each row
+            repeat_counts = X['development_period'] - X['min_development_period'] + 1
+
+            # Step 3: Duplicate the rows
+            # X.index.repeat duplicates the index, and .loc selects those duplicated rows
+            X_expanded = X.loc[X.index.repeat(repeat_counts)].copy()
+
+            # Step 4: Number the duplicated rows (data_as_at_development_period)
+            # We group by the original index (level=0) and use cumcount() which counts 0, 1, 2...
+            X_expanded['data_as_at_development_period'] = (
+                X_expanded['min_development_period'] + X_expanded.groupby(level=0).cumcount()
+            )
+
+            # Step 5: Reset the index to clean up the duplicated index values
+            X_expanded = X_expanded.reset_index(drop=True).sort_values(['claim_no', 'data_as_at_development_period', 'development_period'])
+
+            # Step 6: Scale development period between 0 to 1:
+            X_expanded['development_period'] = X_expanded['development_period'] / self.config["data"].maxdev
+
+            # One record per claim_no and "data up to development period"
+            grouped = X_expanded.reset_index(drop=True).groupby(['claim_no', 'data_as_at_development_period'])
+        else:
+            # One record for claim_no for the original GRU logic by Sarah
+            grouped = X.groupby('claim_no')
         # Convert each group to a tensor
         X_tensors = [torch.tensor(group[self.features].values, dtype=torch.float32) for _, group in grouped]
         # Pad sequences to the same length

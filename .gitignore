@@ -22,3 +22,5 @@ coverage.xml
 *.swp
 *.swo
 *~
+/02_code/runs
+/02_code/logs

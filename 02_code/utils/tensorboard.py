@@ -57,6 +57,10 @@ def generate_enhanced_tensorboard_outputs(model, dat, config: ExperimentConfig, 
     # Generate predictions
     y_pred = model.predict(train)
     
+    # Sum if 2D
+    if y_pred.ndim == 2:
+        y_pred = y_pred.sum(axis=1)
+
     # Merge predictions back into dataset
     claim_nos_dedup = train["claim_no"].drop_duplicates()
     claim_nos = train["claim_no"]

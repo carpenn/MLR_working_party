@@ -22,7 +22,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple
 import datetime
-
+import torch
 from utils.config import ExperimentConfig
 
 
@@ -113,15 +113,17 @@ def date_from_period(period: int, day = 15, base_year = 2000, return_format = "%
     return date_obj.strftime(return_format)
 
 
-def process_data_davide(config: ExperimentConfig, dat: pd.DataFrame) -> pd.DataFrame:
+def process_data_grouped_triangular(config: ExperimentConfig, dat: pd.DataFrame) -> pd.DataFrame:
     """
     Process the claims data.
     
     Args:
         config: Experiment configuration
+        dat: DataFrame of data
         
     Returns:
         Processed DataFrame
+        One record per claim per development month (even if no transactions in month)
     """
 
     transactions = dat
@@ -130,12 +132,7 @@ def process_data_davide(config: ExperimentConfig, dat: pd.DataFrame) -> pd.DataF
 
     # Apply cut-off since some of the logic in this notebook assumes an equal set of dimensions
     transactions["development_period"] = np.minimum(transactions["payment_period"] - transactions["occurrence_period"], config['data'].cutoff)  
-    num_dev_periods = config['data'].cutoff - 1  # (transactions["payment_period"] - transactions["occurrence_period"]).max()
-
-    #transactions["occurence_date"] = transactions["occurrence_period"].apply(lambda x: date_from_period(x))
-    #transactions["payment_date"] = transactions["payment_period"].apply(lambda x: date_from_period(x))
-    #transactions["noti_date"] = (transactions["occurrence_period"] + transactions["noti_period"]).apply(lambda x: date_from_period(x))
-    #transactions["settle_date"] = (transactions["occurrence_period"] + transactions["settle_period"]).apply(lambda x: date_from_period(x))
+    num_dev_periods = config['data'].cutoff - 1  
 
     # Transactions summarised by claim/dev:
     transactions_group = (transactions
@@ -200,18 +197,6 @@ def process_data_davide(config: ExperimentConfig, dat: pd.DataFrame) -> pd.DataF
 
     dat['occurrence_date'] = pd.to_datetime(dat['occurrence_date']).dt.to_period('Q')
     dat['payment_date'] = pd.to_datetime(dat['payment_date']).dt.to_period('Q')
-
-
-    # Potential features for model later:
-    #data_cols = [
-    #    "notidel", 
-    #    "occurrence_time", 
-    #    "development_period", 
-    #    "payment_period", 
-    #    "has_payment_to_prior_period",
-    #    "log1_payment_to_prior_period",
-    #    "payment_count_to_prior_period",
-    #    ]
 
     # The notebook is created on an MacBook Pro M1, which supports GPU mode in float32 only.
     dat[dat.select_dtypes(np.float64).columns] = dat.select_dtypes(np.float64).astype(np.float32)
@@ -301,7 +286,6 @@ def process_data(config: ExperimentConfig, dat: pd.DataFrame) -> pd.DataFrame:
     return dat
 
 
-
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Dataset Creation
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -375,3 +359,94 @@ def create_train_test_datasets_davide(dat: pd.DataFrame, config: ExperimentConfi
     ].groupby('claim_no')[y_output].last()
     
     return trainx, y_train, testx, y_test
+
+
+def make_claim_sampler(indices_df):
+    """
+    Returns a claims_sampler function based on source dataset with indices
+
+    """
+    def claim_sampler(X, y, sample_weight=None, device=None):
+        indices = torch.tensor(
+            indices_df[["claim_no", "development_period"]]
+            .assign(dummy=1)
+            .reset_index()
+            .groupby(["claim_no", "development_period"])
+            .sample(n=1)
+            .index
+        )
+        if device is not None:
+            indices = indices.to(device)
+        if sample_weight is None:
+            return torch.index_select(X, 0, indices), torch.index_select(y, 0, indices)
+        else:
+            return torch.index_select(sample_weight, 0, indices), torch.index_select(X, 0, indices), torch.index_select(y, 0, indices)
+    return claim_sampler
+
+
+def create_train_test_datasets_seq_3D(
+        dat: pd.DataFrame, 
+        config: ExperimentConfig,
+        epsilon: float=0.0
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+    """
+    Create training and test datasets from processed data.
+    
+    Args:
+        dat: Processed DataFrame
+        config: Experiment configuration
+        epsilon: Add a small value to y_train to avoid numerical issues
+        
+    Returns:
+        Tuple of (w_train, x_train, y_train, w, x, y)
+        Note: this returns a full x and y rather than a test set, 
+              because the history is needed for prediction.
+    """
+    features = config['data'].features
+
+    w_train = dat.loc[dat.train_ind, ['claim_no', 'development_period']].copy()
+    w       = dat.loc[:            , ['claim_no', 'development_period']].copy()
+
+    x_train = dat.loc[dat.train_ind, features + ["claim_no"]]
+    x       = dat.loc[:            , features + ["claim_no"]]
+
+    y_train = dat.loc[dat.train_ind, ['claim_no', 'development_period']].copy()
+    y       = dat.loc[:            , ['claim_no', 'development_period']].copy()
+
+    # 1. Create a lookup Series mapped by (claim_no, development_period)
+    # We drop duplicates just in case there are identical claim/period rows to avoid reindexing errors
+    lookup_payments = dat.set_index(['claim_no', 'development_period'])['payment_size']
+    lookup_train_payments = dat.loc[dat.train_ind].set_index(['claim_no', 'development_period'])['payment_size']
+    lookup_train_ind = dat.set_index(['claim_no', 'development_period'])['train_ind']
+
+    # 2. Loop through 1 to maxdev to create the future columns
+    for n in range(1, config["data"].maxdev):
+        # Calculate the future development period we want to look up
+        # Create a MultiIndex consisting of the current claim_no and the FUTURE target period
+        target_periods = dat['development_period'] + n
+        target_idx = pd.MultiIndex.from_arrays([dat['claim_no'], target_periods])
+
+        train_periods = dat.loc[dat.train_ind, 'development_period'] + n
+        train_idx = pd.MultiIndex.from_arrays([dat.loc[dat.train_ind, 'claim_no'], train_periods])
+
+        # Look up the future payments. 
+        # .reindex() maps the values and returns NaN if that future period doesn't exist
+        # .values ensures the result assigns correctly as a flat array to our DataFrame
+  
+        y[f'future_payment_{n}']       = lookup_payments.reindex(target_idx).values
+        w[f'weight_{n}']               = 1.0
+
+        y_train[f'future_payment_{n}'] = lookup_train_payments.reindex(train_idx).values + epsilon
+
+        w_train[f'weight_{n}'] = np.where(
+            lookup_train_ind.reindex(train_idx) & 
+            (~pd.isna(lookup_train_ind.reindex(train_idx).values)),
+            1.0,
+            0.0
+        )
+
+    # 3. Fill na values
+    y = y.fillna(0.0)
+    y_train = y_train.fillna(0.0)
+
+    return w_train, x_train, y_train, w, x, y

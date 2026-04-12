@@ -1,0 +1,61 @@
+experiment_name: gru_experiment_20260228_000000
+run_timestamp: '20260228_000000'
+save_excel: False
+data:
+  data_dir: https://raw.githubusercontent.com/agi-lab/SPLICE/main/datasets/complexity_1/
+  filename: payment_1.csv
+  cutoff: 40
+  maxdev: 40
+  data_cols:
+  - notidel
+  - occurrence_time
+  - development_period
+  - payment_period
+  - has_payment_to_prior_period 
+  - log1_payment_to_prior_period
+  - payment_count_to_prior_period
+  - claim_no  
+  features:
+  - notidel
+  - occurrence_time
+  - development_period
+  - payment_period
+  - has_payment_to_prior_period
+  - log1_payment_to_prior_period
+  - payment_count_to_prior_period
+  output_field: payment_size
+
+model:
+  batch_norm: false
+  clip_value: null
+  device: default
+  dropout: 0.0
+  keep_best_model: false
+  l1_applies_params:
+  - linear.weight
+  - hidden.weight
+  l1_penalty: 0.0
+  max_lr: 0.02
+  n_hidden: 64
+  weight_decay: 0.01
+
+training:
+  # cv_runs: 24
+  seed: 42
+  enable_shap: false
+  nn_iter: 200
+  print_loss_every_iter: 10
+  use_batching_logic: true
+  rebatch_every_iter: 10
+  shap_background_samples: 100
+  shap_log_frequency: 500
+  shap_max_samples: 50
+  verbose: 1
+
+tensorboard:
+  log_metrics_every: 1
+  log_figures_every: 100
+  log_gradients: true
+  log_weights_histograms: true
+  log_shap_explanations: true
+  shap_log_frequency: 500
